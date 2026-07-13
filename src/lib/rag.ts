@@ -1,4 +1,4 @@
-import { getDocumentProxy, extractText } from "unpdf";
+import { PdfReader } from "pdfreader";
 import mammoth from "mammoth";
 
 // 1. TEXT EXTRACTORS
@@ -11,11 +11,25 @@ export async function extractTextFromFile(buffer: Buffer, fileType: string): Pro
   
   if (type === "pdf") {
     try {
-      const pdf = await getDocumentProxy(new Uint8Array(buffer));
-      const { text } = await extractText(pdf, { mergePages: true });
-      return text || "";
+      return new Promise<string>((resolve, reject) => {
+        let text = "";
+        let page = 1;
+        new PdfReader({}).parseBuffer(buffer, (err: any, item: any) => {
+          if (err) {
+            console.error("PdfReader error:", err);
+            reject(new Error("Failed to extract text from PDF document"));
+          } else if (!item) {
+            resolve(text);
+          } else if (item.text) {
+            text += item.text + " ";
+          } else if (item.page) {
+            text += `\n[Page ${page}]\n`;
+            page++;
+          }
+        });
+      });
     } catch (error) {
-      console.error("Error parsing PDF with unpdf:", error);
+      console.error("Error parsing PDF with pdfreader:", error);
       throw new Error("Failed to extract text from PDF document");
     }
   }
