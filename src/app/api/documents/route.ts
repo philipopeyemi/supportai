@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { getUserFromRequest } from "@/lib/auth";
-import { extractTextFromFile, splitTextIntoChunks, generateEmbedding } from "@/lib/rag";
+import { extractTextFromFile, splitTextIntoChunks, generateEmbedding, generateEmbeddingsBatch } from "@/lib/rag";
 
 export async function GET(req: Request) {
   const user = await getUserFromRequest(req);
@@ -114,19 +114,19 @@ export async function POST(req: Request) {
       const allChunks = splitTextIntoChunks(rawText);
       const chunks = allChunks.slice(0, 150);
 
-      // 3. Generate embeddings in memory
-      const chunksData = [];
-      for (const chunk of chunks) {
-        const vector = await generateEmbedding(chunk.content);
-        chunksData.push({
-          documentId: document.id,
-          content: chunk.content,
-          pageNumber: chunk.pageNumber,
-          embedding: JSON.stringify(vector),
-        });
-      }
+      // 3. Generate embeddings in a single batch API call
+      const chunkContents = chunks.map(c => c.content);
+      const vectors = await generateEmbeddingsBatch(chunkContents);
 
-      // 4. Batch insert all chunks in a single query
+      // 4. Map chunks to database data structures
+      const chunksData = chunks.map((chunk, idx) => ({
+        documentId: document.id,
+        content: chunk.content,
+        pageNumber: chunk.pageNumber,
+        embedding: JSON.stringify(vectors[idx]),
+      }));
+
+      // 5. Batch insert all chunks in a single query
       if (chunksData.length > 0) {
         await prisma.documentChunk.createMany({
           data: chunksData,

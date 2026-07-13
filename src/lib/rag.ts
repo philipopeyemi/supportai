@@ -135,12 +135,13 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     }
   }
   
-  // Deterministic local vectorizer: Hash-based Vector Space Model (Simulated embedding)
-  // Tokenize the string, compute term frequency, hash tokens to indices in a 384-dimensional array.
-  // Normalize vector to unit length so dot product directly yields cosine similarity.
+  // Local fallback
+  return generateLocalEmbedding(text);
+}
+
+// Local fallback execution logic (decoupled for batch calls)
+function generateLocalEmbedding(text: string): number[] {
   const vector = new Array(VECTOR_DIMENSION).fill(0);
-  
-  // Normalize and clean words
   const words = text
     .toLowerCase()
     .replace(/[^\w\s]/g, "")
@@ -148,12 +149,10 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     .filter(w => w.length > 2);
     
   if (words.length === 0) {
-    // Return a random unit vector for empty text
     vector[0] = 1.0;
     return vector;
   }
   
-  // Murmur3-like simple string hash to map words into vector indexes
   const hashString = (str: string): number => {
     let hash = 17;
     for (let i = 0; i < str.length; i++) {
@@ -162,23 +161,18 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     return Math.abs(hash);
   };
   
-  // Populate the sparse vector
   for (const word of words) {
     const idx1 = hashString(word) % VECTOR_DIMENSION;
-    const idx2 = hashString(word + "_2") % VECTOR_DIMENSION; // add some density
-    
+    const idx2 = hashString(word + "_2") % VECTOR_DIMENSION;
     vector[idx1] += 1.0;
     vector[idx2] += 0.5;
   }
   
-  // Calculate Euclidean norm (length) of the vector
   let sumSq = 0;
   for (let i = 0; i < VECTOR_DIMENSION; i++) {
     sumSq += vector[i] * vector[i];
   }
   const norm = Math.sqrt(sumSq);
-  
-  // Normalize vector to length 1
   if (norm > 0) {
     for (let i = 0; i < VECTOR_DIMENSION; i++) {
       vector[i] /= norm;
@@ -186,8 +180,41 @@ export async function generateEmbedding(text: string): Promise<number[]> {
   } else {
     vector[0] = 1.0;
   }
-  
   return vector;
+}
+
+export async function generateEmbeddingsBatch(texts: string[]): Promise<number[][]> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  
+  if (apiKey && apiKey.trim() !== "") {
+    try {
+      const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "cohere/embed-english-v3.0",
+          input: texts,
+        }),
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.data && Array.isArray(data.data)) {
+          // OpenRouter/OpenAI return format matches [{ embedding: [...] }, ...]
+          return data.data.map((item: any) => item.embedding);
+        }
+      }
+      console.warn("Batch embeddings API request failed, falling back to local vectorizer.");
+    } catch (e) {
+      console.error("Error generating API embeddings batch:", e);
+    }
+  }
+  
+  // Fallback to local vectorizer for each chunk
+  return texts.map(text => generateLocalEmbedding(text));
 }
 
 // 4. COSINE SIMILARITY ENGINE
