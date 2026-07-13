@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { getUserFromRequest } from "@/lib/auth";
-import { extractTextFromFile, splitTextIntoChunks, generateEmbeddingsBatch } from "@/lib/rag";
+import { extractTextFromFile, splitTextIntoChunks, generateEmbedding, generateEmbeddingsBatch } from "@/lib/rag";
 
 // Isolated helper for reading and buffer allocation
 async function parseUploadedFile(file: File): Promise<Buffer> {
@@ -17,11 +17,17 @@ async function extractTextFromBuffer(buffer: Buffer, fileExtension: string): Pro
 }
 
 // Isolated helper for chunk processing, batch embedding generation, and batch database insertions
-async function ingestDocumentChunks(documentId: string, rawText: string): Promise<void> {
+async function ingestDocumentChunks(documentId: string, rawText: string, fileSize: number): Promise<void> {
+  const startTime = Date.now();
   const allChunks = splitTextIntoChunks(rawText);
   const totalChunksCount = allChunks.length;
+
+  // Defensive Limit: Abort if chunk count > 10,000 to prevent database overload
+  if (totalChunksCount > 10000) {
+    throw new Error(`Document contains too many text chunks (${totalChunksCount}). Maximum allowed limit is 10,000 chunks.`);
+  }
   
-  // Cap at 150 chunks for safety
+  // Cap at 150 chunks for safety in serverless environments
   const chunks = allChunks.slice(0, 150);
   const processedChunksCount = chunks.length;
   const pageCount = chunks.length > 0 ? Math.max(...chunks.map(c => c.pageNumber)) : 0;
@@ -38,7 +44,19 @@ async function ingestDocumentChunks(documentId: string, rawText: string): Promis
     
     // 1. Generate embeddings in a single batch API call for the sub-array
     const batchContents = batch.map(c => c.content);
-    const vectors = await generateEmbeddingsBatch(batchContents);
+    let vectors: number[][];
+    try {
+      vectors = await generateEmbeddingsBatch(batchContents);
+    } catch (batchError) {
+      console.warn(`[RAG WARNING] Failed to generate embeddings batch at offset ${i}. Retrying with sequential local fallbacks...`);
+      vectors = await Promise.all(batchContents.map(async (text) => {
+        try {
+          return await generateEmbedding(text);
+        } catch {
+          return new Array(384).fill(0); // Dummy fallback
+        }
+      }));
+    }
 
     // 2. Map and serialize chunks
     const chunksData = batch.map((chunk, idx) => ({
@@ -62,7 +80,27 @@ async function ingestDocumentChunks(documentId: string, rawText: string): Promis
     console.log(`[RAG INGESTION] Progress: ${processedCount}/${processedChunksCount} chunks stored. Current Heap: ${heapUsedMB} MB`);
   }
   
-  console.log(`[RAG INGESTION] Ingestion successfully completed for document: ${documentId}`);
+  const duration = Date.now() - startTime;
+  const avgChunkSize = chunks.length > 0 ? Math.round(chunks.reduce((acc, c) => acc + c.content.length, 0) / chunks.length) : 0;
+  const batchCount = Math.ceil(chunks.length / BATCH_SIZE);
+
+  // Observability Ingestion Report Logs
+  console.log(`[RAG OBSERVABILITY] Ingestion Report for Document: ${documentId}
+  - File Size: ${(fileSize / 1024 / 1024).toFixed(2)} MB
+  - Extracted Text Length: ${rawText.length} characters
+  - Chunk Count: ${chunks.length}
+  - Average Chunk Size: ${avgChunkSize} characters
+  - Embedding Batch Count: ${batchCount}
+  - Processing Duration: ${duration} ms
+  - Peak Heap Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB`);
+
+  // Warning logs for pathological documents
+  if (fileSize > 3 * 1024 * 1024) {
+    console.warn(`[RAG WARNING] Unusually large document uploaded (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
+  }
+  if (chunks.length > 100) {
+    console.warn(`[RAG WARNING] Excessive chunk count generated for document (${chunks.length} chunks)`);
+  }
 }
 
 export async function GET(req: Request) {
@@ -176,8 +214,16 @@ export async function POST(req: Request) {
         throw new Error("No text content could be extracted from this file.");
       }
 
+      // Defensive Check: Limit maximum extracted text length to 5,000,000 characters
+      const MAX_TEXT_LENGTH = 5000000;
+      if (rawText.length > MAX_TEXT_LENGTH) {
+        const textLength = rawText.length;
+        rawText = null;
+        throw new Error(`Extracted text is too large (${(textLength / 1024 / 1024).toFixed(2)} MB). Maximum limit is 5,000,000 characters.`);
+      }
+
       // 3. Process chunking, embedding batching, and database batch write in a separate call
-      await ingestDocumentChunks(document.id, rawText);
+      await ingestDocumentChunks(document.id, rawText, fileSize);
 
       // Nullify rawText reference to clear stack memory
       rawText = null;

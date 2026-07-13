@@ -62,7 +62,8 @@ export function splitTextIntoChunks(text: string, options: ChunkOptions = {}): {
   
   const chunks: { content: string; pageNumber: number }[] = [];
   let currentIndex = 0;
-  let pageCounter = 1;
+  let iterations = 0;
+  const MAX_ITERATIONS = 10000;
 
   // Simple page detector based on form-feed characters or common page markers
   const pageBreaks = Array.from(cleanedText.matchAll(/\f|\[Page \d+\]/gi));
@@ -80,6 +81,11 @@ export function splitTextIntoChunks(text: string, options: ChunkOptions = {}): {
   }
   
   while (currentIndex < cleanedText.length) {
+    iterations++;
+    if (iterations > MAX_ITERATIONS) {
+      throw new Error("Chunk splitter exceeded maximum iterations of 10,000");
+    }
+
     let endIndex = currentIndex + chunkSize;
     
     if (endIndex >= cleanedText.length) {
@@ -108,8 +114,18 @@ export function splitTextIntoChunks(text: string, options: ChunkOptions = {}): {
       });
     }
     
-    currentIndex = endIndex - chunkOverlap;
-    if (currentIndex >= cleanedText.length - 50) break;
+    // If we reached the end of the text, terminate the loop immediately
+    if (endIndex >= cleanedText.length) {
+      break;
+    }
+    
+    // Force index advancement by at least 1 character to avoid infinite loop
+    const nextIndex = endIndex - chunkOverlap;
+    if (nextIndex <= currentIndex) {
+      currentIndex = currentIndex + 1;
+    } else {
+      currentIndex = nextIndex;
+    }
   }
   
   return chunks;
