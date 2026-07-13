@@ -110,21 +110,26 @@ export async function POST(req: Request) {
         throw new Error("No text content could be extracted from this file.");
       }
 
-      // 2. Chunk text
-      const chunks = splitTextIntoChunks(rawText);
+      // 2. Chunk text and limit to a maximum of 150 chunks for safety
+      const allChunks = splitTextIntoChunks(rawText);
+      const chunks = allChunks.slice(0, 150);
 
-      // 3. Generate embeddings and save chunks
-      // We process them sequentially or in small batches to avoid rate limits
+      // 3. Generate embeddings in memory
+      const chunksData = [];
       for (const chunk of chunks) {
         const vector = await generateEmbedding(chunk.content);
-        
-        await prisma.documentChunk.create({
-          data: {
-            documentId: document.id,
-            content: chunk.content,
-            pageNumber: chunk.pageNumber,
-            embedding: JSON.stringify(vector),
-          },
+        chunksData.push({
+          documentId: document.id,
+          content: chunk.content,
+          pageNumber: chunk.pageNumber,
+          embedding: JSON.stringify(vector),
+        });
+      }
+
+      // 4. Batch insert all chunks in a single query
+      if (chunksData.length > 0) {
+        await prisma.documentChunk.createMany({
+          data: chunksData,
         });
       }
 
