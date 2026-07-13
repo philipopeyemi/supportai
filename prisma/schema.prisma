@@ -1,0 +1,116 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id             String        @id @default(uuid())
+  name           String
+  email          String        @unique
+  password       String
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([organizationId])
+}
+
+model Organization {
+  id        String    @id @default(uuid())
+  name      String
+  users     User[]
+  chatbots  Chatbot[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+model Chatbot {
+  id              String         @id @default(uuid())
+  name            String
+  organizationId  String
+  organization    Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  instructions    String
+  greetingMessage String         @default("Hello! How can I help you today?")
+  themeColor      String         @default("#2563eb") // Primary brand color
+  suggestions     String         @default("[\"What is SupportIQ AI?\", \"How do I upload documents?\"]") // JSON string of suggested questions
+  documents       Document[]
+  conversations   Conversation[]
+  analytics       Analytics[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([organizationId])
+}
+
+model Document {
+  id         String          @id @default(uuid())
+  title      String
+  chatbotId  String
+  chatbot    Chatbot         @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  fileType   String          // "pdf" | "docx" | "txt" | "md"
+  status     String          // "PENDING" | "PROCESSING" | "TRAINED" | "FAILED"
+  size       Int
+  chunks     DocumentChunk[]
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  @@index([chatbotId])
+}
+
+model DocumentChunk {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  content    String
+  pageNumber Int      @default(1)
+  embedding  String   // JSON stringified array of floats (e.g. [0.12, -0.45, ...])
+  createdAt  DateTime @default(now())
+
+  @@index([documentId])
+}
+
+model Conversation {
+  id        String    @id @default(uuid())
+  chatbotId String
+  chatbot   Chatbot   @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  visitorId String    // Unique tracking ID for the website visitor
+  status    String    @default("ACTIVE") // "ACTIVE" | "CLOSED" | "PAUSED" (human takeover)
+  messages  Message[]
+  rating    Int?      // Optional visitor rating (1-5)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([chatbotId])
+  @@index([visitorId])
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         String       // "USER" | "AI" | "AGENT"
+  content        String
+  sources        String?      // JSON array of matching chunks / page numbers cited
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId])
+}
+
+model Analytics {
+  id                 String   @id @default(uuid())
+  chatbotId          String
+  chatbot            Chatbot  @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  date               DateTime @default(now())
+  conversationsCount Int      @default(0)
+  messagesCount      Int      @default(0)
+  avgResponseTimeMs  Int      @default(0)
+  satisfiedCount     Int      @default(0) // Chats rated 4 or 5 stars
+  unsatisfiedCount   Int      @default(0) // Chats rated 1 or 2 stars
+
+  @@index([chatbotId])
+}
