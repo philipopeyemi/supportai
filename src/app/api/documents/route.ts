@@ -3,7 +3,67 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { getUserFromRequest } from "@/lib/auth";
-import { extractTextFromFile, splitTextIntoChunks, generateEmbedding, generateEmbeddingsBatch } from "@/lib/rag";
+import { extractTextFromFile, splitTextIntoChunks, generateEmbeddingsBatch } from "@/lib/rag";
+
+// Isolated helper for reading and buffer allocation
+async function parseUploadedFile(file: File): Promise<Buffer> {
+  const arrayBuffer = await file.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+// Isolated helper for text extraction
+async function extractTextFromBuffer(buffer: Buffer, fileExtension: string): Promise<string> {
+  return extractTextFromFile(buffer, fileExtension);
+}
+
+// Isolated helper for chunk processing, batch embedding generation, and batch database insertions
+async function ingestDocumentChunks(documentId: string, rawText: string): Promise<void> {
+  const allChunks = splitTextIntoChunks(rawText);
+  const totalChunksCount = allChunks.length;
+  
+  // Cap at 150 chunks for safety
+  const chunks = allChunks.slice(0, 150);
+  const processedChunksCount = chunks.length;
+  const pageCount = chunks.length > 0 ? Math.max(...chunks.map(c => c.pageNumber)) : 0;
+
+  console.log(`[RAG INGESTION] Starting ingestion for document: ${documentId}`);
+  console.log(`[RAG INGESTION] Total chunks: ${totalChunksCount}, Cap limit: ${processedChunksCount}, Estimated pages: ${pageCount}`);
+
+  const BATCH_SIZE = 15;
+  let processedCount = 0;
+
+  // Process chunks in small batches of 15 to keep active heap footprint minimal
+  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+    const batch = chunks.slice(i, i + BATCH_SIZE);
+    
+    // 1. Generate embeddings in a single batch API call for the sub-array
+    const batchContents = batch.map(c => c.content);
+    const vectors = await generateEmbeddingsBatch(batchContents);
+
+    // 2. Map and serialize chunks
+    const chunksData = batch.map((chunk, idx) => ({
+      documentId,
+      content: chunk.content,
+      pageNumber: chunk.pageNumber,
+      embedding: JSON.stringify(vectors[idx]),
+    }));
+
+    // 3. Batch insert the sub-array immediately
+    if (chunksData.length > 0) {
+      await prisma.documentChunk.createMany({
+        data: chunksData,
+      });
+    }
+
+    processedCount += batch.length;
+
+    // Log progress and heap usage to monitor Vercel limits
+    const heapUsedMB = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+    console.log(`[RAG INGESTION] Progress: ${processedCount}/${processedChunksCount} chunks stored. Current Heap: ${heapUsedMB} MB`);
+  }
+  
+  console.log(`[RAG INGESTION] Ingestion successfully completed for document: ${documentId}`);
+}
 
 export async function GET(req: Request) {
   const user = await getUserFromRequest(req);
@@ -78,20 +138,16 @@ export async function POST(req: Request) {
       );
     }
 
-    // Security Check: Restrict file size to 10MB max
-    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+    // Security Check: Restrict file size to 5MB max (Vercel memory limit safety)
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
     if (fileSize > MAX_FILE_SIZE) {
       return NextResponse.json(
-        { error: "File exceeds maximum size boundary of 10MB." },
+        { error: `File too large (${(fileSize / 1024 / 1024).toFixed(2)}MB). Maximum allowed size is 5MB.` },
         { status: 400 }
       );
     }
 
-    // Read file buffer
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // Create document record in PENDING state
+    // Create document record in PROCESSING state
     const document = await prisma.document.create({
       data: {
         title: fileName,
@@ -102,38 +158,31 @@ export async function POST(req: Request) {
       },
     });
 
-    // Start RAG processing
+    console.log(`[DOCUMENT UPLOAD] Created document ${document.id} in PROCESSING state. Size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
+
+    // Start RAG processing pipeline using isolated scopes
     try {
-      // 1. Extract text
-      const rawText = await extractTextFromFile(buffer, fileExtension);
+      // 1. Read binary buffer inside an isolated function scope
+      let buffer: Buffer | null = await parseUploadedFile(file);
+
+      // 2. Extract text inside an isolated function scope
+      let rawText: string | null = await extractTextFromBuffer(buffer, fileExtension);
+
+      // Nullify buffer reference immediately to release memory before chunking/embeddings
+      buffer = null;
+
       if (!rawText || rawText.trim().length === 0) {
+        rawText = null;
         throw new Error("No text content could be extracted from this file.");
       }
 
-      // 2. Chunk text and limit to a maximum of 150 chunks for safety
-      const allChunks = splitTextIntoChunks(rawText);
-      const chunks = allChunks.slice(0, 150);
+      // 3. Process chunking, embedding batching, and database batch write in a separate call
+      await ingestDocumentChunks(document.id, rawText);
 
-      // 3. Generate embeddings in a single batch API call
-      const chunkContents = chunks.map(c => c.content);
-      const vectors = await generateEmbeddingsBatch(chunkContents);
+      // Nullify rawText reference to clear stack memory
+      rawText = null;
 
-      // 4. Map chunks to database data structures
-      const chunksData = chunks.map((chunk, idx) => ({
-        documentId: document.id,
-        content: chunk.content,
-        pageNumber: chunk.pageNumber,
-        embedding: JSON.stringify(vectors[idx]),
-      }));
-
-      // 5. Batch insert all chunks in a single query
-      if (chunksData.length > 0) {
-        await prisma.documentChunk.createMany({
-          data: chunksData,
-        });
-      }
-
-      // Update document to TRAINED
+      // Update document status to TRAINED (Completed)
       const updatedDoc = await prisma.document.update({
         where: { id: document.id },
         data: { status: "TRAINED" },
